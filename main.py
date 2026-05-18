@@ -95,8 +95,17 @@ def ai_shell(engine: Engine, model: str = None):
 
         print("  Thinking...", end="\r")
         out = translator.ask(question)
-        print(f"  SQL: {out['sql']}")
-        print(_fmt(out["result"]))
+        pairs = out["results"]
+
+        if len(pairs) == 1:
+            sql, result = pairs[0]
+            print(f"  SQL: {sql}")
+            print(_fmt(result))
+        else:
+            # Multiple statements (e.g. "insert fake data" → several INSERTs)
+            for i, (sql, result) in enumerate(pairs, 1):
+                print(f"  [{i}] {sql}")
+                print(f"      {_fmt(result)}")
         print()
 
 

@@ -1,5 +1,6 @@
+import re
 import subprocess
-from typing import Optional
+from typing import List, Optional
 
 from dbms.engine import Engine
 
@@ -11,6 +12,10 @@ class OllamaTranslator:
     """
 
     DEFAULT_MODEL = "llama3.2"
+
+    # Only statement-opening keywords — used to find statement boundaries
+    _STMT_KW = {"SELECT", "INSERT", "CREATE", "DROP", "DELETE", "UPDATE"}
+    _STMT_RE = re.compile(r"\b(SELECT|INSERT|CREATE|DROP|DELETE|UPDATE)\b", re.IGNORECASE)
 
     def __init__(self, engine: Engine, model: str = DEFAULT_MODEL):
         self.engine = engine
@@ -35,12 +40,12 @@ class OllamaTranslator:
     # ── prompt ────────────────────────────────────────────────────────────────
 
     def _prompt(self, question: str) -> str:
-        return f"""You are a SQL generator for AskMyDB, a custom database engine.
+        return f"""You are a SQL generator for AskMyDB, a minimal custom database engine.
 
 Database schema:
 {self._schema_text()}
 
-Supported SQL (use EXACTLY this syntax):
+SUPPORTED syntax:
   SELECT [* | col, ...] FROM table [WHERE cond] [ORDER BY col [ASC|DESC]] [LIMIT n]
   INSERT INTO table [(col, ...)] VALUES (val, ...)
   CREATE TABLE table (col TYPE [PRIMARY KEY], ...)
@@ -51,9 +56,21 @@ Supported SQL (use EXACTLY this syntax):
 WHERE operators: =  !=  <  >  <=  >=  AND  OR
 Column types: INTEGER  FLOAT  STRING
 
+NOT SUPPORTED — never use any of these:
+  - SQL functions: LOWER(), UPPER(), RAND(), COUNT(), SUM(), SUBSTR(), REPEAT(), etc.
+  - Arithmetic or string expressions: x+1, x*2, 'a'||'b'
+  - Subqueries, JOINs, GROUP BY, HAVING, OVER()
+  - NULL as a value — use 0, 0.0, or '' instead
+
+VALUES must be plain literals only:  42   3.14   'hello world'
+
+For "insert fake/sample data" requests: generate several INSERT statements with
+hardcoded literal values (no functions), one per line, each ending with a semicolon.
+
 User request: "{question}"
 
-Reply with ONLY the SQL statement. No explanation. No markdown. No backticks."""
+Respond with ONLY SQL. No explanation, no markdown, no backticks.
+Each statement must end with a semicolon."""
 
     # ── Ollama call ───────────────────────────────────────────────────────────
 
@@ -69,48 +86,108 @@ Reply with ONLY the SQL statement. No explanation. No markdown. No backticks."""
         except ImportError:
             pass
 
-        # Fallback: call the ollama CLI
+        # Fallback: call the ollama CLI  (run `pip install ollama` to skip this path)
         try:
             result = subprocess.run(
                 ["ollama", "run", self.model],
                 input=prompt,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",   # never crash on non-UTF-8 bytes from the CLI
                 timeout=60,
             )
             return result.stdout.strip() if result.returncode == 0 else None
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        except (FileNotFoundError, subprocess.TimeoutExpired, UnicodeDecodeError):
             return None
+
+    # ── SQL extraction ────────────────────────────────────────────────────────
+
+    def _extract_statements(self, raw: str) -> List[str]:
+        """
+        Parse raw LLM output into a list of clean SQL statements.
+
+        Handles:
+        - Markdown fences
+        - Curly/smart quotes
+        - Multiple statements on one line (no semicolons)
+        - Extra explanatory text before/after the SQL
+        """
+        lines = raw.splitlines()
+
+        # Strip markdown fences
+        if lines and lines[0].lstrip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+
+        # Collapse to a single string and normalise smart quotes
+        text = " ".join(lines)
+        for curly, straight in [("‘", "'"), ("’", "'"),
+                                  ("“", "'"), ("”", "'")]:
+            text = text.replace(curly, straight)
+
+        # Split on explicit semicolons first
+        parts = [p.strip() for p in text.split(";") if p.strip()]
+
+        statements: List[str] = []
+        for part in parts:
+            if not part.split():
+                continue
+
+            # Always split by statement-keyword boundaries within the part.
+            # This handles both "normal" parts and LLM responses that glued two
+            # statements together without a semicolon.
+            matches = list(self._STMT_RE.finditer(part))
+            if not matches:
+                continue
+            for i, m in enumerate(matches):
+                end = matches[i + 1].start() if i + 1 < len(matches) else len(part)
+                segment = part[m.start():end].strip()
+                if segment and segment.split()[0].upper() in self._STMT_KW:
+                    statements.append(segment)
+
+        return statements
 
     # ── public API ────────────────────────────────────────────────────────────
 
     def translate(self, question: str) -> Optional[str]:
-        """Return the SQL string for a plain-English question, or None on failure."""
+        """Return the first SQL statement for a plain-English question."""
         raw = self._call_ollama(self._prompt(question))
         if not raw:
             return None
-        # Strip accidental markdown fences
-        lines = raw.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        return "\n".join(lines).strip()
+        stmts = self._extract_statements(raw)
+        return stmts[0] if stmts else None
 
     def ask(self, question: str) -> dict:
-        """Full pipeline: English → SQL → execute → return result dict."""
-        sql = self.translate(question)
-        if not sql:
+        """
+        Full pipeline: English → SQL → execute all statements → return results.
+
+        Returns a dict with:
+          sql      — the SQL string(s) that were generated (joined by newline)
+          results  — list of (sql_stmt, result) pairs
+          error    — True if any statement returned an error
+        """
+        raw = self._call_ollama(self._prompt(question))
+        if not raw:
             return {
                 "question": question,
                 "sql": None,
-                "result": "Could not generate SQL. Is Ollama running? (`ollama serve`)",
-                "error": True,
+                "results": [(None, "Could not generate SQL — is Ollama running? (`ollama serve`)")]
             }
-        result = self.engine.execute(sql)
+
+        stmts = self._extract_statements(raw)
+        if not stmts:
+            return {
+                "question": question,
+                "sql": raw,
+                "results": [(raw, "Could not extract a valid SQL statement from the response.")]
+            }
+
+        pairs = [(s, self.engine.execute(s)) for s in stmts]
         return {
             "question": question,
-            "sql": sql,
-            "result": result,
-            "error": isinstance(result, str) and result.startswith("Error:"),
+            "sql": ";\n".join(stmts),
+            "results": pairs,
+            "error": any(isinstance(r, str) and r.startswith("Error:") for _, r in pairs),
         }
