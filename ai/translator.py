@@ -16,6 +16,7 @@ class OllamaTranslator:
     # Only statement-opening keywords — used to find statement boundaries
     _STMT_KW = {"SELECT", "INSERT", "CREATE", "DROP", "DELETE", "UPDATE"}
     _STMT_RE = re.compile(r"\b(SELECT|INSERT|CREATE|DROP|DELETE|UPDATE)\b", re.IGNORECASE)
+    _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")  # strips color/formatting codes from CLI output
 
     def __init__(self, engine: Engine, model: str = DEFAULT_MODEL):
         self.engine = engine
@@ -113,6 +114,9 @@ Each statement must end with a semicolon."""
         - Multiple statements on one line (no semicolons)
         - Extra explanatory text before/after the SQL
         """
+        # Remove ANSI escape sequences that the Ollama CLI injects (colors, cursor moves, etc.)
+        raw = self._ANSI_RE.sub("", raw)
+
         lines = raw.splitlines()
 
         # Strip markdown fences
